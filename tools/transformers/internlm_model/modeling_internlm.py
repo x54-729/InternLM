@@ -1,10 +1,6 @@
-# coding=utf-8
-# Copyright (c) InternLM. All rights reserved.
+# Copyright (c) The InternLM team and The HuggingFace Inc. team. All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+# This code is based on transformers/src/transformers/models/llama/modeling_llama.py
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,6 +47,31 @@ from .configuration_internlm import InternLMConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "InternLMConfig"
+
+flash_attn_func, flash_attn_varlen_func = None, None
+pad_input, index_first_axis, unpad_input = None, None, None
+def _import_flash_attn():
+    global flash_attn_func, flash_attn_varlen_func
+    global pad_input, index_first_axis, unpad_input
+    try:
+        from flash_attn import flash_attn_func as _flash_attn_func, flash_attn_varlen_func as _flash_attn_varlen_func
+        from flash_attn.bert_padding import pad_input as _pad_input, index_first_axis as _index_first_axis, unpad_input as _unpad_input
+        flash_attn_func, flash_attn_varlen_func = _flash_attn_func, _flash_attn_varlen_func
+        pad_input, index_first_axis, unpad_input = _pad_input, _index_first_axis, _unpad_input
+    except ImportError:
+        raise ImportError("flash_attn is not installed.")
+
+
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = nn.functional.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -239,8 +260,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
         k_sin = sin[position_ids].unsqueeze(1).expand(k.shape)
         k_embed = (k * k_cos) + (rotate_half(k) * k_sin)
     else:
-        cos = cos[position_ids].unsqueeze(1).expand(q.shape)
-        sin = sin[position_ids].unsqueeze(1).expand(q.shape)
+        cos = cos[position_ids].unsqueeze(1)
+        sin = sin[position_ids].unsqueeze(1)
         q_embed = (q * cos) + (rotate_half(q) * sin)
         k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -286,6 +307,7 @@ class InternLMAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.bias)
         self.rotary_emb = self._init_rope()
+        self.is_causal = True
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -379,13 +401,168 @@ class InternLMAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+    
+class InternLMFlashAttention2(InternLMAttention):
+    """
+    InternLM2 flash attention module. This module inherits from `InternLM2Attention` as the weights of the module stays
+    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
+    flash attention and deal with padding tokens in case the input contains any of them.
+    """
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # InternLM2FlashAttention2 attention does not support output_attentions
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = (
+            self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        )
+        value_states = (
+            self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        )
+
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        kv_seq_len = key_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        dropout_rate = 0.0 if not self.training else self.attention_dropout
+
+        attn_output = self._flash_attention_forward(
+            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        )
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+    def _flash_attention_forward(
+        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+    ):
+        """
+        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
+        first unpad the input, then computes the attention scores and pad the final attention scores.
+
+        Args:
+            query_states (`torch.Tensor`):
+                Input query states to be passed to Flash Attention API
+            key_states (`torch.Tensor`):
+                Input key states to be passed to Flash Attention API
+            value_states (`torch.Tensor`):
+                Input value states to be passed to Flash Attention API
+            attention_mask (`torch.Tensor`):
+                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
+                position of padding tokens and 1 for the position of non-padding tokens.
+            dropout (`int`, *optional*):
+                Attention dropout
+            softmax_scale (`float`, *optional*):
+                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
+        """
+        # Contains at least one padding token in the sequence
+        causal = self.is_causal and query_length != 1
+        if attention_mask is not None:
+            batch_size = query_states.shape[0]
+            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._unpad_input(
+                query_states, key_states, value_states, attention_mask, query_length
+            )
+
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+            attn_output_unpad = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_in_batch_q,
+                max_seqlen_k=max_seqlen_in_batch_k,
+                dropout_p=dropout,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+
+            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        else:
+            attn_output = flash_attn_func(
+                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+            )
+
+        return attn_output
+
+    def _unpad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+        key_layer = index_first_axis(
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        value_layer = index_first_axis(
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+
+        if query_length == kv_seq_len:
+            query_layer = index_first_axis(
+                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
+            )
+            cu_seqlens_q = cu_seqlens_k
+            max_seqlen_in_batch_q = max_seqlen_in_batch_k
+            indices_q = indices_k
+        elif query_length == 1:
+            max_seqlen_in_batch_q = 1
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=query_layer.device
+            )  # There is a memcpy here, that is very bad.
+            indices_q = cu_seqlens_q[:-1]
+            query_layer = query_layer.squeeze(1)
+        else:
+            # The -q_len: slice assumes left padding.
+            attention_mask = attention_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+
+        return (
+            query_layer,
+            key_layer,
+            value_layer,
+            indices_q.to(torch.int64),
+            (cu_seqlens_q, cu_seqlens_k),
+            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+        )
+
+INTERNLM_ATTENTION_CLASSES = {
+    "eager": InternLMAttention,
+    "flash_attention_2": InternLMFlashAttention2,
+}
 
 class InternLMDecoderLayer(nn.Module):
     def __init__(self, config: InternLMConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = InternLMAttention(config=config)
+        
+        self.self_attn = INTERNLM_ATTENTION_CLASSES[config.attn_implementation](config=config)
+
         self.mlp = InternLMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -562,8 +739,10 @@ class InternLMModel(InternLMPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.config = config
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        
         self.layers = nn.ModuleList([InternLMDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = InternLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -622,6 +801,9 @@ class InternLMModel(InternLMPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if self.config.attn_implementation == "flash_attention_2":
+            _import_flash_attn()
+
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
@@ -650,14 +832,16 @@ class InternLMModel(InternLMPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        # embed positions
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
+        if self.config.attn_implementation == "flash_attention_2":
+            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+        else:
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
+                )
+            attention_mask = self._prepare_decoder_attention_mask(
+                attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
             )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-        )
 
         hidden_states = inputs_embeds
 
@@ -782,6 +966,7 @@ class InternLMForCausalLM(InternLMPreTrainedModel):
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         Returns:
+
         Example:
         ```python
         >>> from transformers import AutoTokenizer, InternLMForCausalLM
@@ -793,7 +978,9 @@ class InternLMForCausalLM(InternLMPreTrainedModel):
         >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
-        ```"""
+        ```
+
+        """
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
